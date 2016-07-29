@@ -34,7 +34,7 @@ allprojects {
   apply plugin: 'groovy'
 
   ext {
-    spinnakerDependenciesVersion = "0.47.0"
+    spinnakerDependenciesVersion = "0.47.0-dev.1+f01ee93"
   }
 
   if (spinnakerDependenciesVersion.indexOf('-dev') != -1) {

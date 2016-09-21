@@ -49,18 +49,19 @@ class DefaultAllowedAccountsValidator implements AllowedAccountsValidator {
     if (description.hasProperty("credentials")) {
       if (description.credentials instanceof Collection) {
         description.credentials.each { AccountCredentials credentials ->
-          validateTargetAccount(credentials, allowedAccounts, description, user, errors)
+          validateTargetAccount(credentials, allowedAccounts, description, user, errors, 'write')
         }
       } else {
-        validateTargetAccount(description.credentials, allowedAccounts, description, user, errors)
+        validateTargetAccount(description.credentials, allowedAccounts, description, user, errors, 'write')
       }
     } else {
       errors.rejectValue("credentials", "missing", "no credentials found in description: ${description.class.simpleName})")
     }
   }
 
-  private void validateTargetAccount(AccountCredentials credentials, Collection<String> allowedAccounts, Object description, String user, Errors errors) {
-    def requiredGroups = credentials.requiredGroupMembership*.toLowerCase()
+  private void validateTargetAccount(AccountCredentials credentials, Collection<String> allowedAccounts, Object description, String user, Errors errors, String requiredAccess) {
+
+    def requiredGroups = Optional.ofNullable(credentials.requiredRoles[requiredAccess]).map({it*.toLowerCase()}).orElse([])
     def targetAccount = credentials.name
     def isAuthorized = !requiredGroups || allowedAccounts.find { it.equalsIgnoreCase(targetAccount) }
     def json = null

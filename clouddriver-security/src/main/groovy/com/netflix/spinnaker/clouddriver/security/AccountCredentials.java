@@ -18,7 +18,9 @@ package com.netflix.spinnaker.clouddriver.security;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Implementations of this interface will provide properties specific to a named account object,
@@ -80,7 +82,26 @@ public interface AccountCredentials<T> {
     /**
      * A user in ANY required group should be allowed access to this account.
      *
+     * @deprecated use roleRequiredGroupMembership to delineate access by specific role
      * @return the group names that govern access to this account, empty indicates a public account accessible by all.
      */
+    @Deprecated
     List<String> getRequiredGroupMembership();
+
+    /**
+     * A Map keyed on the name of the role, listing groups that grant that role.
+     *
+     * Expected roles would be
+     * 'read'  - able to view resources in an account
+     * 'write' - able to make changes to resources in an account
+     *
+     * The default implementation just returns a mapping for 'write' to the the contents of the
+     * requiredGroupMembership to preserve compatibility with the previous behavior.
+     *
+     * @return a mapping of role to the listing of groups that grant that role. No explicit mapping for a
+     *         role indicates publicly accessible for that role (TODO-cfieber - orly?)
+     */
+    default Map<String, List<String>> getRequiredRoles() {
+        return Collections.singletonMap("write", getRequiredGroupMembership());
+    }
 }

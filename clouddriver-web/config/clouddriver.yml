@@ -49,7 +49,7 @@ default:
     env: default
 
 aws:
-  enabled: ${AWS_ENABLED:false}
+  enabled: true
   # proxy:
   #  proxyHost: 10.0.0.54
   #  proxyPort: 8888
@@ -58,25 +58,8 @@ aws:
   #  proxyDomain: foo
   #  proxyWorkstation: foo
   #  protocol: HTTP
-  defaults:
-    iamRole: FooRole
-    unknownInstanceTypeBlockDevice:
-      deviceName: /dev/sdb
-      size: 40
-    instanceClassBlockDevices:
-    - instanceClass: m3
-      blockDevices:
-      - deviceName: /dev/sdb
-        virtualName: ephemeral0
-      - deviceName: /dev/sdc
-        virtualName: ephemeral1
-  defaultRegions:
-    - name: us-east-1
-  defaultKeyPairTemplate: '{{name}}-keypair'
-
   # an empty list means we are directly managing the AWS account we have credentials for (named default.account.env)
   # see prod profile section below for an example configuration to manage other accounts via STS assume role
-  accounts: []
 
 azure:
   enabled: ${AZURE_ENABLED:false}
@@ -354,8 +337,11 @@ spring:
   profiles: local
 
 # an AWSCredentialsProvider that obtains session credentials via SSH through a bastion instance (useful for local development):
-#bastion:
-#  enabled: false
-#  port: 22
-#  proxyRegion: us-west-1
-#  proxyCluster: my-credentials-cluster
+bastion:
+  enabled: true
+  port: 22
+  proxyRegion: us-west-1
+  proxyCluster: spinnaker-standalone
+  host: aws.test.netflix.net
+  accountIamRole: asgard
+

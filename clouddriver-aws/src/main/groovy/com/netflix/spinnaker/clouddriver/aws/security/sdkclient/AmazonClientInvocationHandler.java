@@ -31,6 +31,9 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.collect.ImmutableMap;
+import com.netflix.spectator.api.Id;
+import com.netflix.spectator.api.Registry;
 import com.netflix.spinnaker.clouddriver.aws.security.EddaTimeoutConfig;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpResponse;
@@ -49,6 +52,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 public class AmazonClientInvocationHandler implements InvocationHandler {
 
@@ -62,19 +66,25 @@ public class AmazonClientInvocationHandler implements InvocationHandler {
   private final String serviceName;
   private final ObjectMapper objectMapper;
   private final EddaTimeoutConfig eddaTimeoutConfig;
+  private final Registry registry;
+  private final Map<String, String> metricTags;
 
   public AmazonClientInvocationHandler(Object delegate,
                                        String serviceName,
                                        String edda,
                                        HttpClient httpClient,
                                        ObjectMapper objectMapper,
-                                       EddaTimeoutConfig eddaTimeoutConfig) {
+                                       EddaTimeoutConfig eddaTimeoutConfig,
+                                       Registry registry,
+                                       Map<String, String> metricTags) {
     this.edda = edda;
     this.httpClient = httpClient;
     this.objectMapper = objectMapper;
     this.delegate = delegate;
     this.serviceName = serviceName;
     this.eddaTimeoutConfig = eddaTimeoutConfig == null ? EddaTimeoutConfig.DEFAULT : eddaTimeoutConfig;
+    this.registry = registry;
+    this.metricTags = ImmutableMap.copyOf(metricTags);
   }
 
   @Override
@@ -309,6 +319,10 @@ public class AmazonClientInvocationHandler implements InvocationHandler {
 
   private byte[] getJson(String objectName, String key) throws IOException {
     final String url = edda + "/REST/v2/aws/" + objectName + (key == null ? ";_expand" : "/" + key) + ";_meta";
+    final Map<String, String> metricTags = new HashMap<>(this.metricTags);
+    metricTags.put("collection", objectName);
+    metricTags.put("collectionReadType", key == null ? "full" : "single");
+
     HttpGet get = new HttpGet(url);
     get.setConfig(RequestConfig.custom().setConnectTimeout(eddaTimeoutConfig.getConnectTimeout()).setSocketTimeout(eddaTimeoutConfig.getSocketTimeout()).build());
 
@@ -320,18 +334,29 @@ public class AmazonClientInvocationHandler implements InvocationHandler {
     while (retryAttempts < eddaTimeoutConfig.getMaxAttempts()) {
       ex = null;
       HttpEntity entity = null;
+      long startTime = System.nanoTime();
+      int httpStatusCode = 0;
       try {
         HttpResponse response = httpClient.execute(get);
         entity = response.getEntity();
-        if (response.getStatusLine().getStatusCode() != HttpStatus.SC_OK) {
+        httpStatusCode = response.getStatusLine().getStatusCode();
+        if (httpStatusCode != HttpStatus.SC_OK) {
           lastException = response.getProtocolVersion().toString() + " " + response.getStatusLine().getStatusCode() + " " + response.getStatusLine().getReasonPhrase();
         } else {
-          return getBytesFromInputStream(entity.getContent(), entity.getContentLength());
+          long httpReadStart = System.nanoTime();
+          try {
+            return getBytesFromInputStream(entity.getContent(), entity.getContentLength());
+          } finally {
+            registry.timer(registry.createId("edda.httpReadTime", metricTags)).record(System.nanoTime() - httpReadStart, TimeUnit.NANOSECONDS);
+          }
         }
       } catch (IOException ioe) {
         lastException = ioe.getClass().getSimpleName() + ": " + ioe.getMessage();
         ex = ioe;
       } finally {
+        String classification = lastException == null ? "SUCCESS" : (ex == null ? "HTTP_FAILURE" : "IOException");
+        Id httpTime = registry.createId("edda.httpRequestTime", metricTags).withTag("httpStatus", Integer.toString(httpStatusCode)).withTag("classification", classification);
+        registry.timer(httpTime).record(System.nanoTime() - startTime, TimeUnit.NANOSECONDS);
         EntityUtils.consume(entity);
       }
       final String exceptionFormat = "Edda request {} failed with {}";
@@ -340,11 +365,13 @@ public class AmazonClientInvocationHandler implements InvocationHandler {
       } else {
         log.warn(exceptionFormat, url, lastException, ex);
       }
+      registry.counter(registry.createId("edda.retryDelayMillis", metricTags)).increment(retryDelay);
       try {
         Thread.sleep(retryDelay);
       } catch (InterruptedException inter) {
         break;
       }
+      registry.counter(registry.createId("edda.retries", metricTags)).increment();
       retryAttempts++;
       retryDelay += r.nextInt(eddaTimeoutConfig.getBackoffMillis());
     }

@@ -119,7 +119,7 @@ public class DefaultAWSAccountInfoLookup implements AWSAccountInfoLookup {
         }
         List<AWSRegion> awsRegions = new ArrayList<>(regions.size());
         for (Region region : regions) {
-            ec2.setEndpoint(region.getEndpoint());
+            ec2 = amazonClientProvider.getAmazonEC2(credentialsProvider, region.getRegionName());
             List<AvailabilityZone> azs = ec2.describeAvailabilityZones().getAvailabilityZones();
             List<String> availabilityZoneNames = new ArrayList<>(azs.size());
             for (AvailabilityZone az : azs) {

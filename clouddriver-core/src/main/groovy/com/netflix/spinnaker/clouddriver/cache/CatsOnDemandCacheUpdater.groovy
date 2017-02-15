@@ -19,9 +19,9 @@ package com.netflix.spinnaker.clouddriver.cache
 import com.netflix.spinnaker.cats.agent.Agent
 import com.netflix.spinnaker.cats.agent.AgentLock
 import com.netflix.spinnaker.cats.agent.AgentScheduler
-import com.netflix.spinnaker.cats.agent.AgentSchedulerAware
 import com.netflix.spinnaker.cats.module.CatsModule
 import com.netflix.spinnaker.cats.provider.Provider
+import com.netflix.spinnaker.clouddriver.cache.OnDemandAgent.OnDemandType
 import groovy.util.logging.Slf4j
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Component
@@ -39,7 +39,7 @@ class CatsOnDemandCacheUpdater implements OnDemandCacheUpdater {
   AgentScheduler agentScheduler
 
   @Autowired
-  public CatsOnDemandCacheUpdater(List<Provider> providers, CatsModule catsModule) {
+  CatsOnDemandCacheUpdater(List<Provider> providers, CatsModule catsModule) {
     this.providers = providers
     this.catsModule = catsModule
   }
@@ -51,32 +51,72 @@ class CatsOnDemandCacheUpdater implements OnDemandCacheUpdater {
   }
 
   @Override
-  boolean handles(OnDemandAgent.OnDemandType type, String cloudProvider) {
+  boolean handles(OnDemandType type, String cloudProvider) {
     onDemandAgents.any { it.handles(type, cloudProvider) }
   }
 
   @Override
-  OnDemandCacheUpdater.OnDemandCacheStatus handle(OnDemandAgent.OnDemandType type, String cloudProvider, Map<String, ? extends Object> data) {
-    Collection<OnDemandAgent> onDemandAgents = onDemandAgents.findAll { it.handles(type, cloudProvider) }
-    return handle(type, onDemandAgents, data)
+  boolean handles(OnDemandType type, String cloudProvider, Map<String, ?> data) {
+    return onDemandAgents.any { it.handles(type, cloudProvider, data) }
   }
 
-  OnDemandCacheUpdater.OnDemandCacheStatus handle(OnDemandAgent.OnDemandType type, Collection<OnDemandAgent> onDemandAgents, Map<String, ? extends Object> data) {
+  @Override
+  boolean supportsBulk() {
+    return onDemandAgents.every { it.supportsBulk() }
+  }
+
+  @Override
+  OnDemandCacheUpdater.OnDemandCacheStatus handle(OnDemandType type, String cloudProvider, Map<String, ? extends Object> data) {
+    handleBulk(type, cloudProvider, Collections.singletonList(data))
+  }
+
+  @Override
+  OnDemandCacheUpdater.OnDemandCacheStatus handleBulk(OnDemandType type, String cloudProvider, List<Map<String, ?>> data) {
+    if (supportsBulk()) {
+      def nullAgent = new Object()
+
+      def agentBulkData = data.groupBy { d ->
+        def allAgents = onDemandAgents.findAll { it.handles(type, cloudProvider, d) }
+        if (allAgents.size() > 1) {
+          throw new IllegalStateException("Multple agents for $d")
+        }
+        allAgents ? allAgents[0] : nullAgent
+      }
+      agentBulkData.remove(nullAgent)
+
+      def result = OnDemandCacheUpdater.OnDemandCacheStatus.SUCCESSFUL
+      agentBulkData.each { OnDemandAgent agent, List<Map<String, ?>> bulkData ->
+        def agentResult = handle(type, [agent], bulkData)
+        if (agentResult == OnDemandCacheUpdater.OnDemandCacheStatus.PENDING) {
+          result = agentResult
+        }
+      }
+      return result
+    } else if (data.size() > 1) {
+      throw new IllegalStateException("bulk handle not supported")
+    } else {
+      Collection<OnDemandAgent> onDemandAgents = onDemandAgents.findAll { it.handles(type, cloudProvider, data[0]) }
+      return handle(type, onDemandAgents, data)
+    }
+  }
+
+
+  OnDemandCacheUpdater.OnDemandCacheStatus handle(OnDemandType type, Collection<OnDemandAgent> onDemandAgents, List<Map<String, ? extends Object>> data) {
     boolean hasOnDemandResults = false
     for (OnDemandAgent agent : onDemandAgents) {
       try {
-        AgentLock lock = null;
+        AgentLock lock = null
         if (agentScheduler.atomic && !(lock = agentScheduler.tryLock((Agent) agent))) {
           hasOnDemandResults = true // force Orca to retry
-          continue;
+          continue
         }
         final long startTime = System.nanoTime()
         def providerCache = catsModule.getProviderRegistry().getProviderCache(agent.providerName)
-        OnDemandAgent.OnDemandResult result = agent.handle(providerCache, data)
+        OnDemandAgent.OnDemandResult result = agent.handleBulk(providerCache, data)
         if (result) {
           if (agentScheduler.atomic && !(agentScheduler.lockValid(lock))) {
             hasOnDemandResults = true // force Orca to retry
-            continue;
+            continue
           }
           if (result.cacheResult) {
             hasOnDemandResults = !(result.cacheResult.cacheResults ?: [:]).values().flatten().isEmpty() && !agentScheduler.atomic
@@ -108,7 +148,7 @@ class CatsOnDemandCacheUpdater implements OnDemandCacheUpdater {
   }
 
   @Override
-  Collection<Map> pendingOnDemandRequests(OnDemandAgent.OnDemandType type, String cloudProvider) {
+  Collection<Map> pendingOnDemandRequests(OnDemandType type, String cloudProvider) {
     if (agentScheduler.atomic) {
       return []
     }

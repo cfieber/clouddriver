@@ -131,7 +131,7 @@ class TitusClusterProvider implements ClusterProvider<TitusCluster> {
    */
   @Override
   TitusCluster getCluster(String application, String account, String name) {
-    CacheData cluster = cacheView.get(CLUSTERS.ns, Keys.getClusterKey(name, application, account))
+    CacheData cluster = cacheView.get(CLUSTERS.ns, Keys.getClusterKey(name, application, account), RelationshipCacheFilter.include(SERVER_GROUPS.ns))
     TitusCluster titusCluster = cluster ? translateClusters([cluster], true)[0] : null
     titusCluster
   }
@@ -214,8 +214,7 @@ class TitusClusterProvider implements ClusterProvider<TitusCluster> {
 
     def titusSecurityGroupCache = [:]
     Map<String, TitusServerGroup> serverGroups = serverGroupData.collectEntries { serverGroupEntry ->
-      String json = objectMapper.writeValueAsString(serverGroupEntry.attributes.job)
-      Job job = objectMapper.readValue(json, Job)
+      Job job = objectMapper.convertValue(serverGroupEntry.attributes.job, Job)
       TitusServerGroup serverGroup = new TitusServerGroup(job, serverGroupEntry.attributes.account, serverGroupEntry.attributes.region)
       serverGroup.instances = serverGroupEntry.relationships[INSTANCES.ns]?.findResults { instances.get(it) } as Set
       resolveAwsDetails(titusSecurityGroupCache, serverGroup)

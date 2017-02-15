@@ -24,7 +24,8 @@ import java.util.Collection;
 
 public interface ProviderCache extends Cache {
     void putCacheResult(String source, Collection<String> authoritativeTypes, CacheResult cacheResult);
-    void putCacheData(String type, CacheData cacheData);
+    void putCacheData(String type, Collection<CacheData> cacheData);
+    void putCacheData(String type, CacheData... cacheData);
 
     Collection<CacheData> getAll(String type, Collection<String> identifiers);
 

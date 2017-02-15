@@ -18,6 +18,7 @@ package com.netflix.spinnaker.clouddriver.cache
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.netflix.discovery.DiscoveryClient
+import com.netflix.spectator.api.Registry
 import com.netflix.spinnaker.cats.agent.AgentScheduler
 import com.netflix.spinnaker.cats.cache.NamedCacheFactory
 import com.netflix.spinnaker.cats.redis.JedisPoolSource
@@ -73,6 +74,11 @@ class RedisCacheConfig {
   @Bean
   AgentIntervalProvider agentIntervalProvider(RedisConfigurationProperties redisConfigurationProperties) {
     new CustomSchedulableAgentIntervalProvider(TimeUnit.SECONDS.toMillis(redisConfigurationProperties.poll.intervalSeconds), TimeUnit.SECONDS.toMillis(redisConfigurationProperties.poll.timeoutSeconds))
+  }
+
+  @Bean
+  OnDemandCacheQueue onDemandCacheQueue(JedisSource jedisSource, Registry registry) {
+    return new RedisOnDemandCacheQueue(jedisSource, registry);
   }
 
   @Bean

@@ -20,9 +20,13 @@ import com.netflix.spinnaker.cats.agent.ExecutionInstrumentation
 import com.netflix.spinnaker.cats.agent.NoopExecutionInstrumentation
 import com.netflix.spinnaker.cats.redis.JedisSource
 import com.netflix.spinnaker.clouddriver.cache.CacheConfig
+import com.netflix.spinnaker.clouddriver.cache.InMemoryOnDemandCacheQueue
 import com.netflix.spinnaker.clouddriver.cache.NoopOnDemandCacheUpdater
+import com.netflix.spinnaker.clouddriver.cache.OnDemandCacheQueue
 import com.netflix.spinnaker.clouddriver.cache.OnDemandCacheUpdater
+import com.netflix.spinnaker.clouddriver.cache.OnDemandConfigurationProperties
 import com.netflix.spinnaker.clouddriver.core.agent.CleanupPendingOnDemandCachesAgent
+import com.netflix.spinnaker.clouddriver.core.agent.ProcessOnDemandCacheQueueAgent
 import com.netflix.spinnaker.clouddriver.core.limits.ServiceLimitConfiguration
 import com.netflix.spinnaker.clouddriver.core.limits.ServiceLimitConfigurationBuilder
 import com.netflix.spinnaker.clouddriver.core.provider.CoreProvider
@@ -62,6 +66,7 @@ import com.netflix.spinnaker.clouddriver.security.MapBackedAccountCredentialsRep
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.boot.context.properties.ConfigurationProperties
+import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.ApplicationContext
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
@@ -76,6 +81,7 @@ import org.springframework.web.client.RestTemplate
   CacheConfig
 ])
 @PropertySource(value = "classpath:META-INF/clouddriver-core.properties", ignoreResourceNotFound = true)
+@EnableConfigurationProperties(OnDemandConfigurationProperties)
 class CloudDriverConfig {
 
   @Bean
@@ -220,9 +226,16 @@ class CloudDriverConfig {
   }
 
   @Bean
-  CoreProvider coreProvider(JedisSource jedisSource, ApplicationContext applicationContext) {
+  @ConditionalOnMissingBean(OnDemandCacheQueue)
+  OnDemandCacheQueue onDemandCacheQueue() {
+    new InMemoryOnDemandCacheQueue();
+  }
+
+  @Bean
+  CoreProvider coreProvider(JedisSource jedisSource, ApplicationContext applicationContext, OnDemandCacheQueue onDemandCacheQueue, List<OnDemandCacheUpdater> onDemandCacheUpdaters) {
     return new CoreProvider([
-      new CleanupPendingOnDemandCachesAgent(jedisSource, applicationContext)
+      new CleanupPendingOnDemandCachesAgent(jedisSource, applicationContext),
+      new ProcessOnDemandCacheQueueAgent(onDemandCacheQueue, onDemandCacheUpdaters)
     ])
   }
 }

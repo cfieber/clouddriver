@@ -95,7 +95,8 @@ public class RedisCache implements WriteableCache {
     private final RedisCacheOptions options;
 
     public RedisCache(String prefix, JedisSource source, ObjectMapper objectMapper, RedisCacheOptions options, CacheMetrics cacheMetrics) {
-        this.prefix = prefix;
+        this.prefix = options.isClusterOnPrefix() ? "{" + prefix + "}" : prefix;
+
         this.source = source;
         this.objectMapper = objectMapper.disable(SerializationFeature.WRITE_NULL_MAP_VALUES);
         this.options = options;

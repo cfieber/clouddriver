@@ -31,14 +31,11 @@ import com.netflix.spinnaker.clouddriver.model.ClusterProvider
 import com.netflix.spinnaker.clouddriver.model.ServerGroupProvider
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
-import org.springframework.stereotype.Component
 
 import static com.netflix.spinnaker.clouddriver.core.provider.agent.Namespace.*
 
-@Component
 class AmazonClusterProvider implements ClusterProvider<AmazonCluster>, ServerGroupProvider {
 
-  private final AmazonCloudProvider amazonCloudProvider
   private final Cache cacheView
   private final AwsProvider awsProvider
 
@@ -49,8 +46,7 @@ class AmazonClusterProvider implements ClusterProvider<AmazonCluster>, ServerGro
   String defaultBuildHost
 
   @Autowired
-  AmazonClusterProvider(AmazonCloudProvider amazonCloudProvider, Cache cacheView, AwsProvider awsProvider) {
-    this.amazonCloudProvider = amazonCloudProvider
+  AmazonClusterProvider(Cache cacheView, AwsProvider awsProvider) {
     this.cacheView = cacheView
     this.awsProvider = awsProvider
   }
@@ -114,7 +110,7 @@ class AmazonClusterProvider implements ClusterProvider<AmazonCluster>, ServerGro
 
   @Override
   String getCloudProviderId() {
-    return amazonCloudProvider.id
+    return AmazonCloudProvider.ID
   }
 
   @Override
@@ -323,9 +319,13 @@ class AmazonClusterProvider implements ClusterProvider<AmazonCluster>, ServerGro
   }
 
   private Map getBuildInfoFromImage(CacheData image) {
+    List<Map> tags = image.attributes.tags
+    tags ? buildBuildInfoFromImage(tags, defaultBuildHost) : null
+  }
 
+  public static Map buildBuildInfoFromImage(List<Map> tags, String defaultBuildHost) {
     Map buildInfo = null
-    String appVersionTag = image.attributes.tags?.find { it.key == "appversion" }?.value
+    String appVersionTag = tags?.find { it.key == "appversion" }?.value
     if (appVersionTag) {
       def appVersion = AppVersion.parseName(appVersionTag)
       if (appVersion) {
@@ -333,11 +333,11 @@ class AmazonClusterProvider implements ClusterProvider<AmazonCluster>, ServerGro
         if (appVersion.buildJobName) {
           buildInfo.jenkins = [name: appVersion.buildJobName, number: appVersion.buildNumber]
         }
-        def buildHost = image.attributes.tags.find { it.key == "build_host" }?.value ?: defaultBuildHost
+        def buildHost = tags.find { it.key == "build_host" }?.value ?: defaultBuildHost
         if (buildHost && buildInfo.containsKey("jenkins")) {
           ((Map) buildInfo.jenkins).host = buildHost
         }
-        def buildInfoUrl = image.attributes.tags?.find { it.key == "build_info_url" }?.value ?: null
+        def buildInfoUrl = tags?.find { it.key == "build_info_url" }?.value ?: null
         if (buildInfoUrl) {
           buildInfo.buildInfoUrl = buildInfoUrl
         }

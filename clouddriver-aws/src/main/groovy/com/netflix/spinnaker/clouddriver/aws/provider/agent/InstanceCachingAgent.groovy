@@ -202,7 +202,7 @@ class InstanceCachingAgent implements CachingAgent, AccountAware, DriftMetric {
     }
   }
 
-  private Map<String, String>  getAmazonHealth(Instance instance) {
+  public static Map<String, String>  getAmazonHealth(Instance instance) {
     InstanceState state = instance.state
     StateReason stateReason = instance.stateReason
     HealthState amazonState = state?.name == InstanceStateName.Running.toString() ? HealthState.Unknown : HealthState.Down

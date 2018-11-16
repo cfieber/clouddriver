@@ -26,20 +26,14 @@ import com.netflix.spinnaker.clouddriver.aws.AmazonCloudProvider
 import com.netflix.spinnaker.clouddriver.model.Application
 import com.netflix.spinnaker.clouddriver.model.ApplicationProvider
 import com.netflix.spinnaker.clouddriver.aws.data.Keys
-import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.stereotype.Component
 
 import static com.netflix.spinnaker.clouddriver.core.provider.agent.Namespace.*
 
-@Component
 class AmazonApplicationProvider implements ApplicationProvider {
-  private final AmazonCloudProvider amazonCloudProvider
   private final Cache cacheView
   private final ObjectMapper objectMapper
 
-  @Autowired
-  AmazonApplicationProvider(AmazonCloudProvider amazonCloudProvider, Cache cacheView, ObjectMapper objectMapper) {
-    this.amazonCloudProvider = amazonCloudProvider
+  AmazonApplicationProvider(Cache cacheView, ObjectMapper objectMapper) {
     this.cacheView = cacheView
     this.objectMapper = objectMapper.enable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
   }
@@ -48,14 +42,14 @@ class AmazonApplicationProvider implements ApplicationProvider {
   Set<Application> getApplications(boolean expand) {
     def relationships = expand ? RelationshipCacheFilter.include(CLUSTERS.ns) : RelationshipCacheFilter.none()
     Collection<CacheData> applications = cacheView.getAll(
-      APPLICATIONS.ns, cacheView.filterIdentifiers(APPLICATIONS.ns, "${amazonCloudProvider.id}:*"), relationships
+      APPLICATIONS.ns, cacheView.filterIdentifiers(APPLICATIONS.ns, "${AmazonCloudProvider.ID}:*"), relationships
     )
     applications.collect this.&translate
   }
 
   @Override
   Application getApplication(String name) {
-    translate(cacheView.get(APPLICATIONS.ns, Keys.getApplicationKey(name)))
+    translate(cacheView.get(APPLICATIONS.ns, Keys.getApplicationKey(name), RelationshipCacheFilter.include(CLUSTERS.ns)))
   }
 
   Application translate(CacheData cacheData) {

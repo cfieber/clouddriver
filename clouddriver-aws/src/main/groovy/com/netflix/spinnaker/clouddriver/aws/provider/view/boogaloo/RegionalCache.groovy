@@ -11,6 +11,8 @@ import com.amazonaws.services.ec2.model.Subnet
 import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerDescription
 import com.amazonaws.services.elasticloadbalancingv2.model.TargetGroup
 import com.amazonaws.services.elasticloadbalancingv2.model.TargetHealthDescription
+import com.fasterxml.jackson.core.type.TypeReference
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.netflix.awsobjectmapper.AmazonObjectMapperConfigurer
 import com.netflix.frigga.Names
 import com.netflix.spinnaker.clouddriver.aws.data.ArnUtils
@@ -20,22 +22,23 @@ import com.netflix.spinnaker.clouddriver.aws.model.edda.InstanceLoadBalancers
 import com.netflix.spinnaker.clouddriver.aws.model.edda.LoadBalancerInstanceState
 import com.netflix.spinnaker.clouddriver.aws.model.edda.TargetGroupHealth
 import com.netflix.spinnaker.clouddriver.aws.security.AmazonCredentials
-import com.netflix.spinnaker.clouddriver.aws.security.EddaTemplater
 import com.netflix.spinnaker.clouddriver.aws.security.NetflixAmazonCredentials
 import com.netflix.spinnaker.clouddriver.eureka.model.EurekaInstance
 import com.netflix.spinnaker.clouddriver.security.AccountCredentialsProvider
+import com.netflix.spinnaker.kork.jedis.RedisClientDelegate
 import groovy.util.logging.Slf4j
-import org.apache.http.impl.client.HttpClientBuilder
-import org.springframework.core.ParameterizedTypeReference
-import org.springframework.http.HttpHeaders
-import org.springframework.http.HttpMethod
-import org.springframework.http.RequestEntity
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory
-import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter
-import org.springframework.web.client.RestTemplate
+import redis.clients.jedis.BinaryJedisCommands
+
+import java.nio.charset.Charset
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import java.util.function.Function
+import java.util.zip.GZIPInputStream
 
 
-class RegionalCache {
+class RegionalCache implements Closeable {
 
     //environment -> region -> data
     Map<String, Map<String, EnvironmentRegionData>> environmentData = [:]
@@ -58,10 +61,27 @@ class RegionalCache {
         return accountData.get(account)
     }
 
-    public RegionalCache(AccountCredentialsProvider acp) {
+    private Encachenator encachenator
+    private ScheduledExecutorService sched
+
+    @Override
+    public void close() {
+        sched.shutdown()
+        encachenator.close()
+
+        if (!sched.awaitTermination(5, TimeUnit.SECONDS)) {
+            sched.shutdownNow()
+        }
+    }
+
+    public RegionalCache(AccountCredentialsProvider acp, RedisClientDelegate redisClientDelegate) {
+        encachenator = new Encachenator(acp, redisClientDelegate)
+        sched = Executors.newScheduledThreadPool(10)
+
         NetflixAmazonCredentials bake = acp.getCredentials('test')
         bake.regions.each { AmazonCredentials.AWSRegion bakeRegion ->
-            images[bakeRegion.name] = new ImageCache(bakeRegion.name, bake)
+            images[bakeRegion.name] = new ImageCache(bakeRegion.name, bake, redisClientDelegate)
+            sched.scheduleWithFixedDelay(images[bakeRegion.name].buildRefreshJob(), 0, 10, TimeUnit.SECONDS)
         }
         def amznCreds = acp.all.findAll { it instanceof NetflixAmazonCredentials && it.eddaEnabled }
         amznCreds.each { NetflixAmazonCredentials cred ->
@@ -70,7 +90,7 @@ class RegionalCache {
                 EnvironmentRegionData erd = env.computeIfAbsent(region.name) {
                     new EnvironmentRegionData(cred.getEnvironment(), region.name)
                 }
-                AccountRegionData ard = new AccountRegionData(cred, region.name, erd, images[region.name])
+                AccountRegionData ard = new AccountRegionData(cred, region.name, erd, images[region.name], redisClientDelegate, sched)
                 [(region.name): ard]
             }
             accountData.put(cred.name, ards)
@@ -95,37 +115,94 @@ class EnvironmentRegionData {
 @Slf4j
 class AmazonRegionData<T> {
 
-    private static final RestTemplate tmpl = buildRestTemplate()
+    @Slf4j
+    static class RefreshJob<T> implements Runnable {
+        private static final ObjectMapper mapper = AmazonObjectMapperConfigurer.createConfigured()
+        final AmazonRegionData<T> regionData
 
-    static RestTemplate buildRestTemplate() {
-        def mapper = AmazonObjectMapperConfigurer.createConfigured()
-        HttpComponentsClientHttpRequestFactory clientHttpRequestFactory = new HttpComponentsClientHttpRequestFactory(
-                HttpClientBuilder.create().build())
-        def tmpl = new RestTemplate(clientHttpRequestFactory)
-        tmpl.setMessageConverters([new MappingJackson2HttpMessageConverter(mapper)])
-        return tmpl
+        RefreshJob(AmazonRegionData<T> regionData) {
+            this.regionData = regionData
+        }
+
+        void run() {
+            try {
+                long start = System.nanoTime()
+                byte[] eddaData = timeIt("$regionData.key fetch redis data") {
+                    return regionData.redisClientDelegate.withBinaryClient({ bc ->
+                        bc.get(regionData.redisKey)
+                    } as Function<BinaryJedisCommands, byte[]>)
+                }
+
+                List<T> cacheData = []
+                if (eddaData != null && eddaData.length > 0) {
+                    eddaData = timeIt("$regionData.key inflate redis data") {
+                        return new GZIPInputStream(new ByteArrayInputStream(eddaData)).bytes
+                    }
+
+                    cacheData = timeIt("$regionData.key object mappering") {
+                        return (List<T>) mapper.readValue(eddaData, regionData.typeRef)
+                    }
+                }
+
+                Map<String, Map> indexes = timeIt("$regionData.key indexing") { regionData.buildIndexes(cacheData) }
+                log.info("$regionData.key total rebuild time from redis data set ${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)}millis")
+                regionData.currentState.set(new State<>(cacheData, indexes))
+            } catch (e) {
+                log.warn("Failboat", e)
+            }
+
+        }
+        private static <T> T timeIt(GString msg, Closure<T> closure) {
+            return timeIt(msg.toString(), closure)
+        }
+        private static <T> T timeIt(String msg, Closure<T> closure) {
+            long startTime = System.nanoTime()
+            try {
+                T rv = closure.call()
+                log.info("$msg completed in ${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime)}millis")
+                return rv
+            } catch (e) {
+                log.info("$msg failed in ${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime)}millis")
+                throw e
+            }
+        }
     }
 
     String region
     NetflixAmazonCredentials creds
-
     String eddaCollection
+    TypeReference<List<T>> typeRef
+    RedisClientDelegate redisClientDelegate
 
-    List<T> cacheData
+    static class State<T> {
+        final List<T> cacheData
+        final Map<String, Map> indexes
 
-    AmazonRegionData(String region, NetflixAmazonCredentials creds, String eddaCollection, ParameterizedTypeReference<List<T>> typeRef) {
+        State(List<T> cacheData, Map<String, Map> indexes) {
+            this.cacheData = cacheData
+            this.indexes = indexes
+        }
+    }
+
+    final AtomicReference<State<T>> currentState = new AtomicReference<>(new State<>(Collections.emptyList(), Collections.emptyMap()))
+    String key
+    byte[] redisKey
+
+    AmazonRegionData(String region, NetflixAmazonCredentials creds, String eddaCollection, TypeReference<List<T>> typeRef, RedisClientDelegate redisClientDelegate) {
         this.region = region
         this.creds = creds
         this.eddaCollection = eddaCollection
+        this.typeRef = typeRef
+        this.redisClientDelegate = redisClientDelegate
+        key = "$creds.name/$region/$eddaCollection"
+        redisKey = key.getBytes(Charset.forName('US-ASCII'))
+    }
 
-        URI uri = URI.create(EddaTemplater.defaultTemplater().getUrl(creds.edda, region) + '/REST/v2/aws/' + eddaCollection + ';_expand').normalize()
-        long startTime = System.currentTimeMillis()
-        log.info("Loading $creds.name/$region/$eddaCollection from ${uri.toASCIIString()}")
-        def headers = new HttpHeaders()
-        headers.set(HttpHeaders.ACCEPT_ENCODING, 'gzip')
-        RequestEntity re = new RequestEntity(headers, HttpMethod.GET, uri)
-        cacheData = tmpl.exchange(re, typeRef).getBody()
-        log.info("Loading $creds.name/$region/$eddaCollection completed in ${System.currentTimeMillis() - startTime}ms")
+    RefreshJob<T> buildRefreshJob() {
+        return new RefreshJob<>(this)
+    }
+
+    protected Map<String, Map> buildIndexes(List<T> cacheData) {
     }
 }
 
@@ -146,23 +223,31 @@ class AccountRegionData {
     ClassicLoadBalancerCache clb
     InstanceCache inst
     SubnetCache subnets
+    ScheduledExecutorService sched
 
-    AccountRegionData(NetflixAmazonCredentials account, String region, EnvironmentRegionData environmentRegionData, ImageCache imageCache) {
+    AccountRegionData(NetflixAmazonCredentials account, String region, EnvironmentRegionData environmentRegionData, ImageCache imageCache, RedisClientDelegate redisClientDelegate, ScheduledExecutorService sched) {
         this.region = region
         this.account = account
         this.environmentRegionData = environmentRegionData
         this.img = imageCache
-        asg = new ASGCache(region, account)
-        metric = new MetricAlarmCache(region, account)
-        sp = new ScalingPolicyCache(region, account)
-        sa = new ScheduledActionsCache(region, account)
-        lc = new LaunchConfigCache(region, account)
-        tg = new TargetGroupCache(region, account)
-        tgh = new TargetGroupHealthCache(region, account)
-        clbis = new ClassicLoadBalancerInstanceStateCache(region, account)
-        clb = new ClassicLoadBalancerCache(region, account)
-        inst = new InstanceCache(region, account)
-        subnets = new SubnetCache(region, account)
+        this.sched = sched
+        asg = mkData { new ASGCache(region, account, redisClientDelegate) }
+        metric = mkData { new MetricAlarmCache(region, account, redisClientDelegate) }
+        sp = mkData { new ScalingPolicyCache(region, account, redisClientDelegate) }
+        sa = mkData { new ScheduledActionsCache(region, account, redisClientDelegate) }
+        lc = mkData { new LaunchConfigCache(region, account, redisClientDelegate) }
+        tg = mkData { new TargetGroupCache(region, account, redisClientDelegate) }
+        tgh = mkData { new TargetGroupHealthCache(region, account, redisClientDelegate) }
+        clbis = mkData { new ClassicLoadBalancerInstanceStateCache(region, account, redisClientDelegate) }
+        clb = mkData { new ClassicLoadBalancerCache(region, account, redisClientDelegate) }
+        inst = mkData { new InstanceCache(region, account, redisClientDelegate) }
+        subnets = mkData { new SubnetCache(region, account, redisClientDelegate) }
+    }
+
+    private <T extends AmazonRegionData<?>> T mkData(Closure <T> closure) {
+        T result = closure.call()
+        sched.scheduleWithFixedDelay(result.buildRefreshJob(), 0, 15, TimeUnit.SECONDS)
+        return result
     }
 
     EurekaCache getEureka() {
@@ -172,13 +257,13 @@ class AccountRegionData {
 
 class SubnetCache extends AmazonRegionData<Subnet> {
 
-    SubnetCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'subnets', new ParameterizedTypeReference<List<Subnet>>() {})
+    SubnetCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/subnets', new TypeReference<List<Subnet>>() {}, redisClientDelegate)
     }
 
     List<Subnet> getByVPCZoneIdentifier(String vpcZoneIdentifier) {
         Collection<String> subnetIds = vpcZoneIdentifier.split(',')
-        cacheData.findAll { subnetIds.contains(it.subnetId) }
+        currentState.get().cacheData.findAll { subnetIds.contains(it.subnetId) }
     }
 }
 
@@ -200,167 +285,200 @@ class EurekaCache {
 
 class InstanceCache extends AmazonRegionData<Instance> {
 
-    Map<String, List<Instance>> byASGName
+    InstanceCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'view/instances', new TypeReference<List<Instance>>() {}, redisClientDelegate)
+    }
 
-    InstanceCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, '../view/instances', new ParameterizedTypeReference<List<Instance>>() {})
-        byASGName = new HashMap<>()
+    @Override
+    protected Map<String, Map> buildIndexes(List<Instance> cacheData) {
+        def indexes = [:]
+        indexes.byASGName = new HashMap<>()
         for (Instance instance : cacheData) {
             String asgName = instance.tags.find { it.key == 'aws:autoscaling:groupName' }?.value
             if (asgName) {
-                byASGName.computeIfAbsent(asgName, { [] }).add(instance)
+                indexes.byASGName.computeIfAbsent(asgName, { [] }).add(instance)
             }
         }
+        return indexes
     }
 
     List<Instance> getByASGName(String asgName) {
-        byASGName.get(asgName) ?: []
+        return currentState.get().indexes.byASGName?.get(asgName) ?: []
     }
 }
 class MetricAlarmCache extends AmazonRegionData<MetricAlarm> {
 
-    Map<String, MetricAlarm> byArn
+    MetricAlarmCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/alarms', new TypeReference<List<MetricAlarm>>() {}, redisClientDelegate)
+    }
 
-    MetricAlarmCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'alarms', new ParameterizedTypeReference<List<MetricAlarm>>() {})
-        byArn = new HashMap<>(cacheData.size() + 5000)
+    @Override
+    protected Map<String, Map> buildIndexes(List<MetricAlarm> cacheData) {
+        def indexes = [:]
+        indexes.byArn = new HashMap<String, MetricAlarm>()
         for (MetricAlarm alarm : cacheData) {
-            byArn.put(alarm.alarmArn, alarm)
+            indexes.byArn.put(alarm.alarmArn, alarm)
         }
+        return indexes
     }
 
     List<MetricAlarm> getAlarmsByArns(Collection<String> arns) {
-        arns.findResults { byArn.get(it) }
+        Map<String, MetricAlarm> byArn = currentState.get().indexes.byArn ?: [:]
+        return arns.findResults { byArn.get(it) }
     }
 }
 
 class ScheduledActionsCache extends AmazonRegionData<ScheduledUpdateGroupAction> {
 
-    Map<String, List<ScheduledUpdateGroupAction>> byAsg
+    ScheduledActionsCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/scheduledActions', new TypeReference<List<ScheduledUpdateGroupAction>>() {}, redisClientDelegate)
+    }
 
-    ScheduledActionsCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'scheduledActions', new ParameterizedTypeReference<List<ScheduledUpdateGroupAction>>() {})
-        byAsg = new HashMap<>()
+    @Override
+    protected Map<String, Map> buildIndexes(List<ScheduledUpdateGroupAction> cacheData) {
+        def indexes = [:]
+        indexes.byAsg = new HashMap<String, ScheduledUpdateGroupAction>()
         for (ScheduledUpdateGroupAction action : cacheData) {
-            byAsg.computeIfAbsent(action.autoScalingGroupName, { [] }).add(action)
+            indexes.byAsg.computeIfAbsent(action.autoScalingGroupName, { [] }).add(action)
         }
+        return indexes
     }
 
     List<ScheduledUpdateGroupAction> getScheduledActionByAsgName(String name) {
-        byAsg.get(name) ?: []
+        return currentState.get().indexes.byAsg?.get(name) ?: []
     }
 }
 
 class ScalingPolicyCache extends AmazonRegionData<ScalingPolicy> {
 
-    Map<String, List<ScalingPolicy>> byAsg
+    ScalingPolicyCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/scalingPolicies', new TypeReference<List<ScalingPolicy>>() {}, redisClientDelegate)
+    }
 
-    ScalingPolicyCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'scalingPolicies', new ParameterizedTypeReference<List<ScalingPolicy>>() {})
-        byAsg = new HashMap<>()
+    @Override
+    protected Map<String, Map> buildIndexes(List<ScalingPolicy> cacheData) {
+        def indexes = [:]
+        indexes.byAsg = new HashMap<>()
         for (ScalingPolicy sp : cacheData) {
-            byAsg.computeIfAbsent(sp.autoScalingGroupName, { [] }).add(sp)
+            indexes.byAsg.computeIfAbsent(sp.autoScalingGroupName, { [] }).add(sp)
         }
+        return indexes
     }
 
     List<ScalingPolicy> getScalingPolicyByAsgName(String name) {
-        byAsg.get(name) ?: []
+        return currentState.get().indexes.byAsg?.get(name) ?: []
     }
 
 }
 class ASGCache extends AmazonRegionData<AutoScalingGroup> {
 
-    Map<String, AutoScalingGroup> byName
+    ASGCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/autoScalingGroups', new TypeReference<List<AutoScalingGroup>>() {}, redisClientDelegate)
+    }
 
-    Map<String, Set<String>> asgsByCluster
-
-    Map<String, Set<String>> clustersByApp
-
-    ASGCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'autoScalingGroups', new ParameterizedTypeReference<List<AutoScalingGroup>>() {})
-        byName = new HashMap<>(cacheData.size() + 5000)
-        asgsByCluster = new HashMap<>()
-        clustersByApp = new HashMap<>()
+    @Override
+    protected Map<String, Map> buildIndexes(List<AutoScalingGroup> cacheData) {
+        def indexes = [:]
+        indexes.byName = new HashMap<String, AutoScalingGroup>()
+        indexes.asgsByCluster = new HashMap<String, Set<String>>()
+        indexes.clustersByApp = new HashMap<String, Set<String>>()
         for (AutoScalingGroup asg : cacheData) {
-            byName.put(asg.autoScalingGroupName, asg)
+            indexes.byName.put(asg.autoScalingGroupName, asg)
             def name = Names.parseName(asg.autoScalingGroupName)
             def clusterName = name?.cluster
             if (clusterName) {
-                asgsByCluster.computeIfAbsent(clusterName, { new HashSet<>() }).add(asg.autoScalingGroupName)
-                clustersByApp.computeIfAbsent(name.app, { new HashSet<>() }).add(clusterName)
+                indexes.asgsByCluster.computeIfAbsent(clusterName, { new HashSet<String>() }).add(asg.autoScalingGroupName)
+                indexes.clustersByApp.computeIfAbsent(name.app, { new HashSet<String>() }).add(clusterName)
             }
         }
+        return indexes
     }
 
     AutoScalingGroup getAsgByName(String name) {
-        byName.get(name)
+        return currentState.get().indexes.byName?.get(name)
     }
 
     Collection<String> getAsgsByCluster(String cluster) {
-        asgsByCluster.get(cluster) ?: []
+        return currentState.get().indexes.asgsByCluster?.get(cluster) ?: []
     }
 
     Collection<String> getClustersByApp(String app) {
-        clustersByApp.get(app) ?: []
+        return currentState.get().indexes.clustersByApp?.get(app) ?: []
     }
 }
 
 class LaunchConfigCache extends AmazonRegionData<LaunchConfiguration> {
 
-    Map<String, LaunchConfiguration> byName
+    LaunchConfigCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/launchConfigurations', new TypeReference<List<LaunchConfiguration>>() {}, redisClientDelegate)
+    }
 
-    LaunchConfigCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'launchConfigurations', new ParameterizedTypeReference<List<LaunchConfiguration>>() {})
-        byName = new HashMap<>(cacheData.size() + 5000)
+    @Override
+    protected Map<String, Map> buildIndexes(List<LaunchConfiguration> cacheData) {
+        def indexes = [:]
+        indexes.byName = new HashMap<String, LaunchConfiguration>()
         for (LaunchConfiguration launchConfiguration : cacheData) {
-            byName.put(launchConfiguration.launchConfigurationName, launchConfiguration)
+            indexes.byName.put(launchConfiguration.launchConfigurationName, launchConfiguration)
         }
+        return indexes
     }
 
     LaunchConfiguration getLaunchConfigurationByName(String name) {
-        byName.get(name)
+        return currentState.get().indexes.byName?.get(name)
     }
 }
 
 class ImageCache extends AmazonRegionData<Image> {
 
-    Map<String, Image> byImageId
-    ImageCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'images', new ParameterizedTypeReference<List<Image>>() {})
-        byImageId = new HashMap<>(cacheData.size() + 5000)
+    ImageCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/images', new TypeReference<List<Image>>() {}, redisClientDelegate)
+    }
+
+    @Override
+    protected Map<String, Map> buildIndexes(List<Image> cacheData) {
+        def indexes = [:]
+        indexes.byImageId = new HashMap<String, Image>()
         for (Image img : cacheData) {
-            byImageId.put(img.imageId, img)
+            indexes.byImageId.put(img.imageId, img)
         }
+        return indexes
     }
 
     Image getByImageId(String imageId) {
-        byImageId.get(imageId)
+        return currentState.get().indexes.byImageId?.get(imageId)
     }
 }
 
 class TargetGroupCache extends AmazonRegionData<TargetGroup> {
 
-    Map<String, TargetGroup> byName
+    TargetGroupCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/targetGroups', new TypeReference<List<TargetGroup>>() {}, redisClientDelegate)
+    }
 
-    TargetGroupCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'targetGroups', new ParameterizedTypeReference<List<TargetGroup>>() {})
-        byName = new HashMap<>()
+    @Override
+    protected Map<String, Map> buildIndexes(List<TargetGroup> cacheData) {
+        def indexes = [:]
+        indexes.byName = new HashMap<String, TargetGroup>()
         for (TargetGroup tg : cacheData) {
-            byName.put(tg.targetGroupName, tg)
+            indexes.byName.put(tg.targetGroupName, tg)
         }
+        return indexes
     }
 
     TargetGroup getTargetGroupByName(String name) {
-        return byName.get(name)
+        return currentState.get().indexes.byName?.get(name)
     }
 }
 
 class TargetGroupHealthCache extends AmazonRegionData<TargetGroupHealth> {
 
-    Map<String, InstanceTargetGroups> byInstanceId
+    TargetGroupHealthCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'view/targetGroupHealth', new TypeReference<List<TargetGroupHealth>>() {}, redisClientDelegate)
+    }
 
-    TargetGroupHealthCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, '../view/targetGroupHealth', new ParameterizedTypeReference<List<TargetGroupHealth>>() {})
+    @Override
+    protected Map<String, Map> buildIndexes(List<TargetGroupHealth> cacheData) {
+        def indexes = [:]
         def itgs = InstanceTargetGroups.fromInstanceTargetGroupStates(cacheData.findResults { TargetGroupHealth tgh ->
             tgh.health.findResults { TargetHealthDescription targetHealthDescription ->
                 new InstanceTargetGroupState(
@@ -371,48 +489,57 @@ class TargetGroupHealthCache extends AmazonRegionData<TargetGroupHealth> {
                         targetHealthDescription.targetHealth.description)
             }
         }.flatten())
-        byInstanceId = new HashMap<>(itgs.size() + 5000)
+        indexes.byInstanceId = new HashMap<String, InstanceTargetGroups>()
         for (InstanceTargetGroups itg : itgs) {
-            byInstanceId.put(itg.instanceId, itg)
+            indexes.byInstanceId.put(itg.instanceId, itg)
         }
+        return indexes
     }
 
     InstanceTargetGroups getByInstanceId(String instanceId) {
-        byInstanceId.get(instanceId)
+        currentState.get().indexes.byInstanceId?.get(instanceId)
     }
 }
 
 class ClassicLoadBalancerCache extends AmazonRegionData<LoadBalancerDescription> {
 
-    Map<String, LoadBalancerDescription> byName
+    ClassicLoadBalancerCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'aws/loadBalancers', new TypeReference<List<LoadBalancerDescription>>() {}, redisClientDelegate)
+    }
 
-    ClassicLoadBalancerCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, 'loadBalancers', new ParameterizedTypeReference<List<LoadBalancerDescription>>() {})
-        byName = new HashMap<>(cacheData.size() + 5000)
+    @Override
+    protected Map<String, Map> buildIndexes(List<LoadBalancerDescription> cacheData) {
+        def indexes = [:]
+        indexes.byName = new HashMap<String, LoadBalancerDescription>()
         for (LoadBalancerDescription lb : cacheData) {
-            byName.put(lb.loadBalancerName, lb)
+            indexes.byName.put(lb.loadBalancerName, lb)
         }
+        return indexes
     }
 
     LoadBalancerDescription getLoadBalancerByName(String name) {
-        return byName.get(name)
+        return currentState.get().indexes.byName?.get(name)
     }
 }
 
 class ClassicLoadBalancerInstanceStateCache extends AmazonRegionData<LoadBalancerInstanceState> {
 
-    Map<String, InstanceLoadBalancers> byInstanceId
+    ClassicLoadBalancerInstanceStateCache(String region, NetflixAmazonCredentials creds, RedisClientDelegate redisClientDelegate) {
+        super(region, creds, 'view/loadBalancerInstances', new TypeReference<List<LoadBalancerInstanceState>>() {}, redisClientDelegate)
+    }
 
-    ClassicLoadBalancerInstanceStateCache(String region, NetflixAmazonCredentials creds) {
-        super(region, creds, '../view/loadBalancerInstances', new ParameterizedTypeReference<List<LoadBalancerInstanceState>>() {})
+    @Override
+    protected Map<String, Map> buildIndexes(List<LoadBalancerInstanceState> cacheData) {
+        def indexes = [:]
         def ilbs = InstanceLoadBalancers.fromLoadBalancerInstanceState(cacheData)
-        byInstanceId = new HashMap<>(ilbs.size() + 5000)
+        indexes.byInstanceId = new HashMap<String, InstanceLoadBalancers>()
         for (InstanceLoadBalancers ilb : ilbs) {
-            byInstanceId.put(ilb.instanceId, ilb)
+            indexes.byInstanceId.put(ilb.instanceId, ilb)
         }
+        return indexes
     }
 
     InstanceLoadBalancers getByInstanceId(String instanceId) {
-        byInstanceId.get(instanceId)
+        return currentState.get().indexes.byInstanceId?.get(instanceId)
     }
 }

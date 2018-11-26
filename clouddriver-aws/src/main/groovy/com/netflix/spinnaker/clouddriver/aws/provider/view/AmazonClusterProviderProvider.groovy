@@ -5,6 +5,7 @@ import com.netflix.spinnaker.cats.cache.Cache
 import com.netflix.spinnaker.clouddriver.aws.provider.AwsProvider
 import com.netflix.spinnaker.clouddriver.aws.provider.view.boogaloo.RegionalCache
 import com.netflix.spinnaker.clouddriver.security.AccountCredentialsProvider
+import com.netflix.spinnaker.kork.jedis.RedisClientDelegate
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
@@ -32,8 +33,8 @@ class AmazonClusterProviderProvider {
 
     @Bean
     @ConditionalOnProperty(value = 'amazonProviders.original', havingValue = 'false')
-    RegionalCache regionalCache(AccountCredentialsProvider accountCredentialsProvider) {
-        new RegionalCache(accountCredentialsProvider)
+    RegionalCache regionalCache(AccountCredentialsProvider accountCredentialsProvider, RedisClientDelegate redisClientDelegate) {
+        new RegionalCache(accountCredentialsProvider, redisClientDelegate)
     }
 
     @Bean

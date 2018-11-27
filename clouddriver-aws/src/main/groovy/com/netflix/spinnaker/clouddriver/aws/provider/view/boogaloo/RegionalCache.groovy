@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.function.Function
 import java.util.zip.GZIPInputStream
 
-
+@Slf4j
 class RegionalCache implements Closeable {
 
     //environment -> region -> data
@@ -76,11 +76,13 @@ class RegionalCache implements Closeable {
     }
 
     public RegionalCache(AccountCredentialsProvider acp, RedisClientDelegate redisClientDelegate) {
+        log.info("creating encachenator")
         encachenator = new Encachenator(acp, redisClientDelegate)
         sched = Executors.newScheduledThreadPool(10)
 
         NetflixAmazonCredentials bake = acp.getCredentials('test')
         bake.regions.each { AmazonCredentials.AWSRegion bakeRegion ->
+            log.info("Scheduling image cache for $bakeRegion.name")
             images[bakeRegion.name] = new ImageCache(bakeRegion.name, bake, redisClientDelegate)
             sched.scheduleWithFixedDelay(images[bakeRegion.name].buildRefreshJob(), 0, 10, TimeUnit.SECONDS)
         }
@@ -91,6 +93,7 @@ class RegionalCache implements Closeable {
                 EnvironmentRegionData erd = env.computeIfAbsent(region.name) {
                     new EnvironmentRegionData(cred.getEnvironment(), region.name)
                 }
+                log.info("Creating AccountRegionData for $cred.name/$region.name")
                 AccountRegionData ard = new AccountRegionData(cred, region.name, erd, images[region.name], redisClientDelegate, sched)
                 [(region.name): ard]
             }
@@ -127,6 +130,7 @@ class AmazonRegionData<T> {
 
         void run() {
             try {
+                log.info("$regionData.key starting")
                 long start = System.nanoTime()
                 boolean hashMatch = false
                 byte[] eddaData = timeIt("$regionData.key fetch redis data") {

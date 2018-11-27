@@ -40,7 +40,9 @@ class Encachenator implements Closeable {
         acp.all.findAll { it instanceof NetflixAmazonCredentials && it.eddaEnabled }.each { NetflixAmazonCredentials creds ->
             creds.regions.each { region ->
                 collections.each { collection ->
-                    sched.scheduleWithFixedDelay(new EncachenatorJob(region.name, creds, collection, redisClientDelegate), 15, 30, TimeUnit.SECONDS)
+                    def job = new EncachenatorJob(region.name, creds, collection, redisClientDelegate)
+                    log.info("Scheduling encachenatorjob for $job.key")
+                    sched.scheduleWithFixedDelay(job, 15, 30, TimeUnit.SECONDS)
                 }
             }
         }
@@ -95,6 +97,7 @@ class EncachenatorJob implements Runnable {
 
     public void run() {
         try {
+            log.info("$key starting")
             def hash = Hashing.murmur3_128().newHasher()
             byte[] eddaData = timeIt("$key read edda data") {
                 HttpURLConnection con = uri.toURL().openConnection()

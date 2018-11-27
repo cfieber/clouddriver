@@ -36,13 +36,16 @@ class Encachenator implements Closeable {
     ScheduledExecutorService sched
 
     public Encachenator(AccountCredentialsProvider acp, RedisClientDelegate redisClientDelegate) {
-        sched = Executors.newScheduledThreadPool(10)
+        sched = Executors.newScheduledThreadPool(20)
         acp.all.findAll { it instanceof NetflixAmazonCredentials && it.eddaEnabled }.each { NetflixAmazonCredentials creds ->
             creds.regions.each { region ->
                 collections.each { collection ->
-                    def job = new EncachenatorJob(region.name, creds, collection, redisClientDelegate)
-                    log.info("Scheduling encachenatorjob for $job.key")
-                    sched.scheduleWithFixedDelay(job, 15, 30, TimeUnit.SECONDS)
+                    if (collection != 'aws/images' || creds.name == 'test') {
+                        def job = new EncachenatorJob(region.name, creds, collection, redisClientDelegate)
+                        log.info("Scheduling encachenatorjob for $job.key")
+                        long delayJitter = (int) (Math.random() * 30000d)
+                        sched.scheduleWithFixedDelay(job, delayJitter, 15000, TimeUnit.MILLISECONDS)
+                    }
                 }
             }
         }

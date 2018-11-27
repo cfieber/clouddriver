@@ -68,23 +68,28 @@ class RegionalCache implements Closeable {
     @Override
     public void close() {
         sched.shutdown()
-        encachenator.close()
+        if (encachenator != null) {
+            encachenator.close()
+        }
 
         if (!sched.awaitTermination(5, TimeUnit.SECONDS)) {
             sched.shutdownNow()
         }
     }
 
-    public RegionalCache(AccountCredentialsProvider acp, RedisClientDelegate redisClientDelegate) {
-        log.info("creating encachenator")
-        encachenator = new Encachenator(acp, redisClientDelegate)
+    public RegionalCache(AccountCredentialsProvider acp, RedisClientDelegate redisClientDelegate, boolean encachenate) {
+        if (encachenate) {
+            log.info("creating encachenator")
+            encachenator = new Encachenator(acp, redisClientDelegate)
+        }
         sched = Executors.newScheduledThreadPool(10)
 
         NetflixAmazonCredentials bake = acp.getCredentials('test')
         bake.regions.each { AmazonCredentials.AWSRegion bakeRegion ->
             log.info("Scheduling image cache for $bakeRegion.name")
             images[bakeRegion.name] = new ImageCache(bakeRegion.name, bake, redisClientDelegate)
-            sched.scheduleWithFixedDelay(images[bakeRegion.name].buildRefreshJob(), 0, 10, TimeUnit.SECONDS)
+            long delayJitter = (Math.random() * 30000d)
+            sched.scheduleWithFixedDelay(images[bakeRegion.name].buildRefreshJob(), delayJitter, 5000, TimeUnit.MILLISECONDS)
         }
         def amznCreds = acp.all.findAll { it instanceof NetflixAmazonCredentials && it.eddaEnabled }
         amznCreds.each { NetflixAmazonCredentials cred ->
@@ -273,7 +278,8 @@ class AccountRegionData {
 
     private <T extends AmazonRegionData<?>> T mkData(Closure <T> closure) {
         T result = closure.call()
-        sched.scheduleWithFixedDelay(result.buildRefreshJob(), 0, 15, TimeUnit.SECONDS)
+        long jitter = (Math.random() * 30000d)
+        sched.scheduleWithFixedDelay(result.buildRefreshJob(), jitter, 5000, TimeUnit.MILLISECONDS)
         return result
     }
 

@@ -1,10 +1,12 @@
 package com.netflix.spinnaker.clouddriver.aws.provider.view.boogaloo
 
+import com.google.common.hash.Hashing
 import com.netflix.spinnaker.clouddriver.aws.security.EddaTemplater
 import com.netflix.spinnaker.clouddriver.aws.security.NetflixAmazonCredentials
 import com.netflix.spinnaker.clouddriver.security.AccountCredentialsProvider
 import com.netflix.spinnaker.kork.jedis.RedisClientDelegate
 import groovy.util.logging.Slf4j
+import org.apache.commons.codec.binary.Hex
 import redis.clients.jedis.BinaryJedisCommands
 
 import java.nio.charset.Charset
@@ -62,6 +64,7 @@ class EncachenatorJob implements Runnable {
     final RedisClientDelegate redisClientDelegate
     final String key
     final byte[] redisKey
+    final byte[] redisHashKey
     final URI uri
 
     EncachenatorJob(String region, NetflixAmazonCredentials creds, String eddaCollection, RedisClientDelegate redisClientDelegate) {
@@ -71,6 +74,7 @@ class EncachenatorJob implements Runnable {
         this.redisClientDelegate = redisClientDelegate
         key = "$creds.name/$region/$eddaCollection"
         redisKey = key.getBytes(Charset.forName('US-ASCII'))
+        redisHashKey = "HASH:$key".getBytes(Charset.forName('US-ASCII'))
         uri = URI.create(EddaTemplater.defaultTemplater().getUrl(creds.edda, region) + '/REST/v2/' + eddaCollection + ';_expand').normalize()
     }
 
@@ -91,6 +95,7 @@ class EncachenatorJob implements Runnable {
 
     public void run() {
         try {
+            def hash = Hashing.murmur3_128().newHasher()
             byte[] eddaData = timeIt("$key read edda data") {
                 HttpURLConnection con = uri.toURL().openConnection()
                 con.addRequestProperty("Accept-Encoding", "gzip")
@@ -100,6 +105,7 @@ class EncachenatorJob implements Runnable {
                 con.getInputStream().withStream { is ->
                     while ((bytesRead = is.read(buf)) != -1) {
                         baos.write(buf, 0, bytesRead)
+                        hash.putBytes(buf, 0, bytesRead)
                     }
                 }
                 con.disconnect()
@@ -110,7 +116,15 @@ class EncachenatorJob implements Runnable {
 
             timeIt("$key store edda data") {
                 redisClientDelegate.withBinaryClient({ bc ->
-                    bc.set(redisKey, eddaData)
+                    def existingHash = bc.get(redisHashKey) ?: new byte[0]
+                    def currentHash = hash.hash().asBytes()
+                    if (!Arrays.equals(existingHash, currentHash)) {
+                        log.info("$key hash mismatch, updating the data: existing ${Hex.encodeHex(existingHash)} current ${Hex.encodeHex(currentHash)}")
+                        bc.set(redisHashKey, currentHash)
+                        bc.set(redisKey, eddaData)
+                    } else {
+                        log.info("$key hash matches, skipping save")
+                    }
                 } as Consumer<BinaryJedisCommands>)
             }
         } catch (e) {

@@ -13,6 +13,7 @@ import com.amazonaws.services.elasticloadbalancingv2.model.TargetGroup
 import com.amazonaws.services.elasticloadbalancingv2.model.TargetHealthDescription
 import com.fasterxml.jackson.core.type.TypeReference
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.google.common.hash.Hashing
 import com.netflix.awsobjectmapper.AmazonObjectMapperConfigurer
 import com.netflix.frigga.Names
 import com.netflix.spinnaker.clouddriver.aws.data.ArnUtils
@@ -127,14 +128,31 @@ class AmazonRegionData<T> {
         void run() {
             try {
                 long start = System.nanoTime()
+                boolean hashMatch = false
                 byte[] eddaData = timeIt("$regionData.key fetch redis data") {
                     return regionData.redisClientDelegate.withBinaryClient({ bc ->
-                        bc.get(regionData.redisKey)
+                        def currentHash = regionData.currentState.get().dataHash
+                        if (currentHash != null) {
+                            def redisHash = bc.get(regionData.redisHashKey)
+                            hashMatch = Arrays.equals(redisHash, currentHash)
+                        }
+                        if (!hashMatch) {
+                            return bc.get(regionData.redisKey)
+                        }
+                        return null
                     } as Function<BinaryJedisCommands, byte[]>)
                 }
 
+                if (hashMatch) {
+                    log.info("$regionData.key hash matches, skipping refresh")
+                    return
+                }
+
+
                 List<T> cacheData = []
+                byte[] hash = null
                 if (eddaData != null && eddaData.length > 0) {
+                    hash = Hashing.murmur3_128().hashBytes(eddaData).asBytes()
                     eddaData = timeIt("$regionData.key inflate redis data") {
                         return new GZIPInputStream(new ByteArrayInputStream(eddaData)).bytes
                     }
@@ -146,7 +164,8 @@ class AmazonRegionData<T> {
 
                 Map<String, Map> indexes = timeIt("$regionData.key indexing") { regionData.buildIndexes(cacheData) }
                 log.info("$regionData.key total rebuild time from redis data set ${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)}millis")
-                regionData.currentState.set(new State<>(cacheData, indexes))
+
+                regionData.currentState.set(new State<>(cacheData, indexes, hash))
             } catch (e) {
                 log.warn("Failboat", e)
             }
@@ -177,16 +196,19 @@ class AmazonRegionData<T> {
     static class State<T> {
         final List<T> cacheData
         final Map<String, Map> indexes
+        final byte[] dataHash
 
-        State(List<T> cacheData, Map<String, Map> indexes) {
+        State(List<T> cacheData, Map<String, Map> indexes, dataHash) {
             this.cacheData = cacheData
             this.indexes = indexes
+            this.dataHash = dataHash
         }
     }
 
-    final AtomicReference<State<T>> currentState = new AtomicReference<>(new State<>(Collections.emptyList(), Collections.emptyMap()))
+    final AtomicReference<State<T>> currentState = new AtomicReference<>(new State<>(Collections.emptyList(), Collections.emptyMap(), null))
     String key
     byte[] redisKey
+    byte[] redisHashKey
 
     AmazonRegionData(String region, NetflixAmazonCredentials creds, String eddaCollection, TypeReference<List<T>> typeRef, RedisClientDelegate redisClientDelegate) {
         this.region = region
@@ -196,6 +218,7 @@ class AmazonRegionData<T> {
         this.redisClientDelegate = redisClientDelegate
         key = "$creds.name/$region/$eddaCollection"
         redisKey = key.getBytes(Charset.forName('US-ASCII'))
+        redisHashKey = "HASH:$key".getBytes(Charset.forName('US-ASCII'))
     }
 
     RefreshJob<T> buildRefreshJob() {
